@@ -408,9 +408,7 @@ app.post("/api/pipelines", requireUser, async (req, res) => {
   }
 
   res.status(201).json({ pipeline: data });
-});
-
-app.post("/api/pipelines/:pipelineId/executions", requireUser, async (req, res) => {
+});app.post("/api/pipelines/:pipelineId/executions", requireUser, async (req, res) => {
   const { pipelineId } = req.params;
   const providerSelections = normalizeProviderSelections(req.body?.providers);
   const pipelineResult = await req.supabase
@@ -638,4 +636,180 @@ app.post(
       .select("id")
       .maybeSingle();
 
-   
+    if (claimExecution.error) {
+      return res.status(500).json({ error: getErrorMessage(claimExecution.error) });
+    }
+    if (!claimExecution.data) {
+      return res.status(409).json({ error: "This execution is no longer available for retry." });
+    }
+    if (stuck) activeRuns.get(req.params.executionId)?.stop();
+
+    const resetStep = await req.supabase
+      .from("execution_steps")
+      .update({
+        status: "pending",
+        provider_used: providerId || target.provider_used,
+        output_data: {},
+        updated_at: new Date().toISOString(),
+      })
+      .eq("execution_id", req.params.executionId)
+      .eq("step_number", stepNumber)
+      .eq("status", target.status)
+      .select("id")
+      .maybeSingle();
+
+    if (resetStep.error || !resetStep.data) {
+      await req.supabase
+        .from("executions")
+        .update({
+          status: "paused",
+          current_step: stepNumber,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", req.params.executionId)
+        .eq("user_id", req.user.id)
+        .eq("status", "retrying");
+      return res.status(409).json({ error: resetStep.error ? getErrorMessage(resetStep.error) : "The step changed before it could be reset." });
+    }
+
+    const steps = stepsResult.data.map((step) =>
+      step.step_number === stepNumber
+        ? {
+            ...step,
+            status: "pending",
+            provider_used: providerId || target.provider_used,
+            output_data: {},
+          }
+        : step
+    );
+
+    const resumeClaim = await req.supabase
+      .from("executions")
+      .update({
+        status: "running",
+        current_step: stepNumber,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.executionId)
+      .eq("user_id", req.user.id)
+      .eq("status", "retrying")
+      .select("id")
+      .maybeSingle();
+    if (resumeClaim.error) {
+      return res.status(500).json({ error: getErrorMessage(resumeClaim.error) });
+    }
+    if (!resumeClaim.data) {
+      return res.status(409).json({ error: "This execution was stopped before the retry could begin." });
+    }
+
+    const started = startRun({
+      supabase: req.supabase,
+      executionId: req.params.executionId,
+      userId: req.user.id,
+      steps,
+      startStep: stepNumber,
+    });
+    if (!started) {
+      return res.status(409).json({ error: "A worker is already active for this execution." });
+    }
+
+    res.status(202).json({
+      executionId: req.params.executionId,
+      stepNumber,
+      provider: providerId || target.provider_used,
+      status: "running",
+    });
+  }
+);
+
+app.post("/api/executions/:executionId/stop", requireUser, async (req, res) => {
+  const claim = await req.supabase
+    .from("executions")
+    .update({ status: "failed", updated_at: new Date().toISOString() })
+    .eq("id", req.params.executionId)
+    .eq("user_id", req.user.id)
+    .in("status", ["pending", "running", "retrying", "paused"])
+    .select("id, current_step")
+    .maybeSingle();
+
+  if (claim.error) return res.status(500).json({ error: getErrorMessage(claim.error) });
+  if (!claim.data) return res.status(409).json({ error: "This execution is already finished or stopped." });
+
+  activeRuns.get(req.params.executionId)?.stop();
+  const stoppedStep = await req.supabase
+    .from("execution_steps")
+    .update({
+      status: "failed",
+      output_data: { error: "Manually stopped by user." },
+      updated_at: new Date().toISOString(),
+    })
+    .eq("execution_id", req.params.executionId)
+    .eq("step_number", claim.data.current_step)
+    .in("status", ["processing", "pending"]);
+  if (stoppedStep.error) {
+    console.error("Could not mark stopped step:", stoppedStep.error);
+    return res.status(500).json({ error: getErrorMessage(stoppedStep.error) });
+  }
+
+  res.json({ status: "failed", message: "Manually stopped by user." });
+});
+
+app.get("/api/executions/:executionId", requireUser, async (req, res) => {
+  const executionResult = await req.supabase
+    .from("executions")
+    .select("id, pipeline_id, user_id, status, current_step, created_at, updated_at")
+    .eq("id", req.params.executionId)
+    .eq("user_id", req.user.id)
+    .single();
+
+  if (executionResult.error || !executionResult.data) {
+    return res.status(404).json({ error: "Execution not found." });
+  }
+
+  const stepsResult = await req.supabase
+    .from("execution_steps")
+    .select("id, execution_id, step_number, step_name, status, provider_used, output_data, updated_at")
+    .eq("execution_id", req.params.executionId)
+    .order("step_number", { ascending: true });
+
+  if (stepsResult.error) {
+    return res.status(500).json({ error: getErrorMessage(stepsResult.error) });
+  }
+
+  res.json({ execution: executionResult.data, steps: stepsResult.data });
+});
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(publicDirectory, "index.html"));
+});
+
+app.get("/dashboard", (req, res) => {
+  res.sendFile(path.join(publicDirectory, "dashboard.html"));
+});
+
+app.get("/config.js", (req, res) => {
+  res
+    .type("application/javascript")
+    .send(
+      `export default ${JSON.stringify(app.locals.supabaseConfig)};`
+    );
+});
+
+if (require.main === module) {
+  if (!app.locals.supabaseConfig.supabaseUrl || !app.locals.supabaseConfig.supabaseAnonKey) {
+    throw new Error("SUPABASE_URL and SUPABASE_ANON_KEY environment variables are required.");
+  }
+
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${port}`);
+  });
+}
+
+module.exports = {
+  app,
+  createRunControl,
+  getGroqStepPrompt,
+  parseScriptScenes,
+  runPipelineWorker,
+  withStepTimeout,
+};
