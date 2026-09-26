@@ -1,0 +1,15 @@
+{
+  "name": "my-ai-platform",
+  "version": "1.0.0",
+  "description": "A simple Express web application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}
