@@ -344,9 +344,7 @@ ${previousOutputs[3]}`,
   };
 
   return prompts[stepNumber];
-}
-
-async function runPipelineWorker({
+      }async function runPipelineWorker({
   supabase,
   executionId,
   userId,
@@ -590,4 +588,142 @@ async function runPipelineWorker({
             audio_url: audio.url,
             voice: audio.voice,
             provider: audio.provider || "edge_tts",
-       
+            ...(completionStatus === "completed_with_warning" ? { warning: "ElevenLabs key not set; used Edge TTS." } : {}),
+          };
+        } else if (step.step_number === 13) {
+          const imageUrl = previousStepData[7]?.image_url;
+          const audioPath = localPathFromOutputUrl(previousStepData[10]?.audio_url);
+          let video;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              video = await assembleVideo({
+                imageUrl,
+                audioPath,
+                executionId,
+                attemptId: run.attemptId,
+                signal,
+                attempt: attempt + 1,
+              });
+              break;
+            } catch (error) {
+              if (signal.aborted || attempt === 1 || error.message === "Video assembly timed out.") throw error;
+              console.warn(`Step 13 attempt 1 failed; retrying in 10 seconds:`, error.message);
+              await new Promise((resolve, reject) => {
+                const onAbort = () => {
+                  clearTimeout(timer);
+                  reject(new Error("Video assembly timed out."));
+                };
+                const timer = setTimeout(() => {
+                  signal.removeEventListener("abort", onAbort);
+                  resolve();
+                }, 10000);
+                signal.addEventListener("abort", onAbort, { once: true });
+                if (signal.aborted) onAbort();
+              });
+            }
+          }
+          outputData = {
+            video_url: video.url,
+            duration_seconds: Number(video.duration.toFixed(2)),
+          };
+        } else {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, 2000);
+            signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new Error("Step timed out after 3 minutes"));
+            }, { once: true });
+          });
+          outputData = {
+            message: "Step completed by the workflow worker.",
+            completed_at: new Date().toISOString(),
+          };
+        }
+        return { outputData, completionStatus };
+      }, run, step.step_number === 13 ? VIDEO_ASSEMBLY_TIMEOUT_MS : STEP_TIMEOUT_MS, step.step_number === 13 ? "Video assembly timed out." : "Step timed out after 3 minutes");
+      checkRun(run);
+      previousStepData[step.step_number] = outputData;
+
+      const completed = await supabase
+        .from("execution_steps")
+        .update({
+          status: completionStatus,
+          output_data: outputData,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("execution_id", executionId)
+        .eq("step_number", step.step_number)
+        .eq("status", "processing")
+        .select("id")
+        .maybeSingle();
+
+      if (completed.error) throw completed.error;
+      if (!completed.data) {
+        checkRun(run);
+        throw new Error(`Step ${step.step_number} was changed before it completed.`);
+      }
+    }
+
+    checkRun(run);
+    const executionComplete = await supabase
+      .from("executions")
+      .update({
+        status: "completed",
+        current_step: steps.length,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", executionId)
+      .eq("user_id", userId)
+      .eq("status", "running");
+
+    if (executionComplete.error) throw executionComplete.error;
+  } catch (error) {
+    if (run.cancelled) return;
+    const safeMessage = getErrorMessage(error);
+    console.error(`Worker failed for execution ${executionId}:`, safeMessage);
+
+    const pause = await supabase
+      .from("executions")
+      .update({
+        status: "paused",
+        current_step: activeStepNumber,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", executionId)
+      .eq("user_id", userId)
+      .eq("status", "running")
+      .select("id")
+      .maybeSingle();
+    if (pause.error) console.error("Could not pause execution:", pause.error);
+    if (!pause.data) return;
+
+    if (activeStepNumber > 0) {
+      const failed = await supabase
+        .from("execution_steps")
+        .update({
+          status: "failed",
+          output_data: { error: safeMessage },
+          updated_at: new Date().toISOString(),
+        })
+        .eq("execution_id", executionId)
+        .eq("step_number", activeStepNumber)
+        .in("status", ["processing", "pending"]);
+      if (failed.error) console.error("Could not save step failure:", failed.error);
+    }
+  }
+}
+
+module.exports = {
+  STEP_TIMEOUT_MS,
+  VIDEO_ASSEMBLY_TIMEOUT_MS,
+  createRunControl,
+  getGroqStepPrompt,
+  loadProviderConfigs,
+  parseScriptScenes,
+  parseStoredOutput,
+  pipelineStepNames,
+  providerKeyFields,
+  imageProviderIds,
+  runPipelineWorker,
+  withStepTimeout,
+};
